@@ -21,8 +21,9 @@
 
 use crate::{
 	chain_extension::ChainExtension,
+	storage::meter::Diff,
 	wasm::{env_def::ImportSatisfyCheck, PrefabWasmModule},
-	Config, Schedule,
+	AccountIdOf, BalanceOf, CodeHash, Config, Schedule,
 };
 use pwasm_utils::parity_wasm::elements::{self, External, Internal, MemoryType, Type, ValueType};
 use sp_runtime::traits::Hash;
@@ -395,9 +396,11 @@ fn check_and_instrument<C: ImportSatisfyCheck, T: Config>(
 fn do_preparation<C: ImportSatisfyCheck, T: Config>(
 	original_code: Vec<u8>,
 	schedule: &Schedule<T>,
+	owner: Option<AccountIdOf<T>>,
 ) -> Result<PrefabWasmModule<T>, &'static str> {
 	let (code, (initial, maximum)) =
 		check_and_instrument::<C, T>(original_code.as_ref(), schedule)?;
+	let deposit = deposit::<T>(code.len(), original_code.len());
 	Ok(PrefabWasmModule {
 		instruction_weights_version: schedule.instruction_weights.version,
 		initial,
@@ -405,10 +408,25 @@ fn do_preparation<C: ImportSatisfyCheck, T: Config>(
 		_reserved: None,
 		code,
 		original_code_len: original_code.len() as u32,
-		refcount: 1,
+		refcount: 0,
 		code_hash: T::Hashing::hash(&original_code),
 		original_code: Some(original_code),
+		owner,
+		deposit,
 	})
+}
+
+/// Calculate the amount of balance a user needs to put down as deposit for deploying a code.
+fn deposit<T: Config>(code_len: usize, original_len: usize) -> BalanceOf<T> {
+	use sp_std::mem::size_of;
+	let bytes_added = size_of::<PrefabWasmModule<T>>()
+		.saturating_add(code_len)
+		.saturating_add(original_len)
+		.saturating_sub(size_of::<CodeHash<T>>()) as u32;
+	Diff { bytes_added, items_added: 2, ..Default::default() }
+		.to_usage::<T>()
+		.to_deposit()
+		.charge_or_zero()
 }
 
 /// Loads the given module given in `original_code`, performs some checks on it and
@@ -425,8 +443,9 @@ fn do_preparation<C: ImportSatisfyCheck, T: Config>(
 pub fn prepare_contract<T: Config>(
 	original_code: Vec<u8>,
 	schedule: &Schedule<T>,
+	owner: AccountIdOf<T>,
 ) -> Result<PrefabWasmModule<T>, &'static str> {
-	do_preparation::<super::runtime::Env, T>(original_code, schedule)
+	do_preparation::<super::runtime::Env, T>(original_code, schedule, Some(owner))
 }
 
 /// The same as [`prepare_contract`] but without constructing a new [`PrefabWasmModule`]
@@ -471,9 +490,11 @@ pub mod benchmarking {
 			_reserved: None,
 			code: contract_module.into_wasm_code()?,
 			original_code_len: original_code.len() as u32,
-			refcount: 1,
+			refcount: 0,
 			code_hash: T::Hashing::hash(&original_code),
 			original_code: Some(original_code),
+			owner: None,
+			deposit: Default::default(),
 		})
 	}
 }
@@ -526,7 +547,7 @@ mod tests {
 					},
 					.. Default::default()
 				};
-				let r = do_preparation::<env::Test, crate::tests::Test>(wasm, &schedule);
+				let r = do_preparation::<env::Test, crate::tests::Test>(wasm, &schedule, None);
 				assert_matches::assert_matches!(r, $($expected)*);
 			}
 		};
